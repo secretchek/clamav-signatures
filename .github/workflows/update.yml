@@ -1,0 +1,87 @@
+name: Update ClamAV signatures
+
+# Public mirror of the official ClamAV databases for servers that cannot reach
+# database.clamav.net directly. Every file is the unmodified official CVD plus its
+# official detached signature (.cvd.sign); ClamAV verifies both on load, so this
+# mirror cannot alter detection content.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: signatures
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UA: "ClamAV/1.5.4 (OS: linux-gnu, ARCH: x86_64, CPU: x86_64)"
+      TAG: signatures
+    steps:
+      - name: Install ClamAV tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clamav dnsutils jq
+
+      - name: Read current official versions
+        id: versions
+        run: |
+          txt="$(dig +short TXT current.cvd.clamav.net | tr -d '"')"
+          echo "dns=$txt"
+          IFS=: read -r _ main daily _ _ _ _ bytecode _ <<<"$txt"
+          for v in "$main" "$daily" "$bytecode"; do [[ "$v" =~ ^[0-9]+$ ]] || { echo "bad DNS TXT: $txt"; exit 1; }; done
+          echo "main=$main" >> "$GITHUB_OUTPUT"
+          echo "daily=$daily" >> "$GITHUB_OUTPUT"
+          echo "bytecode=$bytecode" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch what the mirror already has
+        run: |
+          mkdir -p db
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "ClamAV signatures" --notes "Official ClamAV databases, refreshed every 6 hours." --latest
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D db --clobber || true
+          ls -la db
+
+      - name: Download only changed databases (with official signatures)
+        run: |
+          set -euo pipefail
+          cd db
+          changed=0
+          for pair in "main:${{ steps.versions.outputs.main }}" "daily:${{ steps.versions.outputs.daily }}" "bytecode:${{ steps.versions.outputs.bytecode }}"; do
+            name="${pair%%:*}"; want="${pair##*:}"
+            have=""
+            [ -f "$name.cvd" ] && have="$(head -c 512 "$name.cvd" | cut -d: -f3)"
+            if [ "$have" = "$want" ] && [ -f "$name-$want.cvd.sign" ]; then echo "$name $want up to date"; continue; fi
+            curl -fsS --retry 3 -A "$UA" -o "$name.cvd.new" "https://database.clamav.net/$name.cvd"
+            got="$(head -c 512 "$name.cvd.new" | cut -d: -f3)"
+            [ "$got" = "$want" ] || { echo "$name: header $got != DNS $want, retry next run"; rm -f "$name.cvd.new"; continue; }
+            curl -fsS --retry 3 -A "$UA" -o "$name-$want.cvd.sign" "https://database.clamav.net/$name-$want.cvd.sign"
+            mv "$name.cvd.new" "$name.cvd"
+            rm -f $(ls "$name"-*.cvd.sign | grep -v -- "-$want.cvd.sign") 2>/dev/null || true
+            changed=1
+          done
+          echo "changed=$changed" >> "$GITHUB_ENV"
+
+      - name: Verify and publish
+        if: env.changed == '1'
+        run: |
+          set -euo pipefail
+          cd db
+          for name in main daily bytecode; do sigtool --info "$name.cvd" | grep -q "Verification OK"; done
+          jq -n --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{generatedAt:$at, files:[inputs]}' \
+            <(for f in *.cvd *.cvd.sign; do jq -n --arg n "$f" --arg s "$(sha256sum "$f" | cut -d" " -f1)" --argjson b "$(stat -c%s "$f")" '{name:$n,sha256:$s,bytes:$b}'; done) > manifest.json
+          cat manifest.json
+          # Remove release assets that are no longer current, then upload the new set.
+          for old in $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'); do
+            [ -f "$old" ] || gh release delete-asset "$TAG" "$old" -R "$GITHUB_REPOSITORY" -y
+          done
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber *.cvd *.cvd.sign manifest.json
